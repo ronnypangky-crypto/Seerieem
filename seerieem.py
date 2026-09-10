@@ -27,17 +27,14 @@ def fmt(val):
 
 def send_telegram(msg):
     if not TG_TOKEN or not TG_CHAT_ID:
-        print(f"⚠️ TG_TOKEN={bool(TG_TOKEN)} TG_CHAT_ID={bool(TG_CHAT_ID)}")
         return
     text = f"💰 *Keuangan Bot*\n{msg}\n⏰ {now_str()}"
-    print(f"📤 Kirim Telegram ke {TG_CHAT_ID}: {msg[:50]}")
     try:
-        r = requests.post(
+        requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             json={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "Markdown"},
             timeout=10
         )
-        print(f"📤 Response: {r.status_code} {r.text[:100]}")
     except Exception as e:
         print(f"TG Error: {e}")
 

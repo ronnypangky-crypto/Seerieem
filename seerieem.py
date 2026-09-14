@@ -305,7 +305,7 @@ def scan_saham():
         return
 
     # Scan hanya jam trading: 09:00-16:00 WIB
-    if not (9 <= now.hour < 16):
+    if not (now.hour > 8 or (now.hour == 8 and now.minute >= 30)) or now.hour >= 16:
         print(f"[{now_str()}] Di luar jam trading — skip scan")
         return
 
@@ -435,11 +435,11 @@ def main():
                     "Selamat weekend! 🎉"
                 )
 
-            # Notif Senin jam 09:00 — pasar buka
-            if now_check.weekday() == 0 and now_check.hour == 9 and now_check.minute == 0 and tick % 12 == 0:
+            # Notif setiap hari Senin-Jumat jam 08:30 — pasar buka
+            if now_check.weekday() < 5 and now_check.hour == 8 and now_check.minute == 30 and tick % 12 == 0:
                 send_telegram(
                     "🔔 *Pasar Buka!*\n"
-                    "📅 Senin 09:00 WIB — Bursa buka!\n"
+                    "📅 08:30 WIB — Bursa buka!\n"
                     "📊 Bot mulai scan saham...\n"
                     "Semangat trading! 💪"
                 )

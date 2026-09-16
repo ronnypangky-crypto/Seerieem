@@ -1,33 +1,32 @@
-import os, time, requests, json
+import os, time, requests, json, base64, re
 from datetime import datetime, timezone, timedelta
 
 # ── Config ─────────────────────────────────────────────
-TG_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "")
-TG_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
-NEWS_API    = os.environ.get("NEWS_API_KEY", "")  # dari newsapi.org (gratis)
+TG_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO  = os.environ.get("GITHUB_REPO", "")
+GITHUB_FILE  = "saham_data.json"
 
 WIB = timezone(timedelta(hours=7))
 
-# ── Daftar Saham yang Dipantau ──────────────────────────
-# Tambah/hapus sesuai kebutuhan
-WATCHLIST = [
-    "BUMI", "BRPT", "DEWA", "FIRE", "KONI",
-    "MITI", "MICE", "PGAS", "TINS", "ANTM",
-    "BSDE", "WIKA", "ADHI", "PTPP", "WSKT"
-]
-
 # ── State ───────────────────────────────────────────────
-last_update_id  = 0
-volume_history  = {}  # {ticker: [vol1, vol2, ...]}
-price_history   = {}  # {ticker: [price1, price2, ...]}
-alerted_today   = set()  # ticker yang sudah dapat alert hari ini
+last_update_id = 0
+alerted_today  = set()
+data = {
+    "watchlist": [],
+    "posisi": {}
+}
 
 # ── Helpers ─────────────────────────────────────────────
 def now_str():
     return datetime.now(WIB).strftime("%d/%m/%Y %H:%M")
 
-def fmt_harga(val):
-    return f"Rp {val:,.0f}".replace(",", ".")
+def fmt(val):
+    return f"Rp {abs(val):,.0f}".replace(",", ".")
+
+def log(msg):
+    print(f"[{datetime.now(WIB).strftime('%H:%M:%S')}] {msg}", flush=True)
 
 def send_telegram(msg):
     if not TG_TOKEN or not TG_CHAT_ID:
@@ -39,62 +38,86 @@ def send_telegram(msg):
             timeout=10
         )
     except Exception as e:
-        print(f"TG Error: {e}")
+        log(f"TG Error: {e}")
 
-# ── Fetch Data Saham (Yahoo Finance) ────────────────────
+# ── GitHub Storage ───────────────────────────────────────
+def load_data():
+    global data
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        log("⚠️ GitHub tidak dikonfigurasi!")
+        return
+    try:
+        r = requests.get(
+            f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}",
+            headers={"Authorization": f"token {GITHUB_TOKEN}"},
+            timeout=10
+        )
+        if r.status_code == 200:
+            content = base64.b64decode(r.json()["content"]).decode("utf-8")
+            data = json.loads(content)
+            log(f"✅ Data loaded — {len(data['watchlist'])} saham dipantau")
+        else:
+            log("📂 File belum ada — mulai dari awal")
+            save_data()
+    except Exception as e:
+        log(f"⚠️ Gagal load: {e}")
+
+def save_data():
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return
+    try:
+        r = requests.get(
+            f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}",
+            headers={"Authorization": f"token {GITHUB_TOKEN}"},
+            timeout=10
+        )
+        sha = r.json().get("sha", "") if r.status_code == 200 else ""
+        content = base64.b64encode(
+            json.dumps(data, indent=2, ensure_ascii=False).encode()
+        ).decode()
+        payload = {"message": f"Update saham {now_str()}", "content": content}
+        if sha:
+            payload["sha"] = sha
+        requests.put(
+            f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}",
+            headers={"Authorization": f"token {GITHUB_TOKEN}"},
+            json=payload, timeout=15
+        )
+        log("✅ Data tersimpan ke GitHub!")
+    except Exception as e:
+        log(f"⚠️ Gagal save: {e}")
+
+# ── Fetch Data Saham ────────────────────────────────────
 def get_stock_data(ticker):
-    """Ambil data saham dari Yahoo Finance"""
     try:
         symbol = f"{ticker}.JK"
         url    = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-        params = {
-            "interval": "1d",
-            "range":    "30d",
-        }
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, params=params, headers=headers, timeout=10)
-        data = r.json()
-
-        result = data.get("chart", {}).get("result", [])
+        r = requests.get(url, params={"interval": "1d", "range": "30d"},
+                        headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        result = r.json().get("chart", {}).get("result", [])
         if not result:
             return None
-
-        meta    = result[0].get("meta", {})
         quotes  = result[0].get("indicators", {}).get("quote", [{}])[0]
-        timestamps = result[0].get("timestamp", [])
-
-        closes  = quotes.get("close", [])
-        volumes = quotes.get("volume", [])
-        opens   = quotes.get("open", [])
-
-        if not closes or not volumes:
-            return None
-
-        # Filter None values
-        closes  = [c for c in closes  if c is not None]
-        volumes = [v for v in volumes if v is not None]
-
+        closes  = [c for c in quotes.get("close",  []) if c is not None]
+        volumes = [v for v in quotes.get("volume", []) if v is not None]
         if len(closes) < 5 or len(volumes) < 5:
             return None
-
         return {
-            "ticker":       ticker,
-            "price":        closes[-1],
-            "price_prev":   closes[-2],
-            "volume":       volumes[-1],
-            "volume_avg":   sum(volumes[:-1]) / len(volumes[:-1]),
-            "closes":       closes,
-            "volumes":      volumes,
-            "currency":     meta.get("currency", "IDR"),
+            "ticker":     ticker,
+            "price":      closes[-1],
+            "price_prev": closes[-2],
+            "volume":     volumes[-1],
+            "vol_avg":    sum(volumes[:-1]) / len(volumes[:-1]),
+            "closes":     closes,
+            "volumes":    volumes,
         }
     except Exception as e:
-        print(f"⚠️ Gagal fetch {ticker}: {e}")
+        log(f"⚠️ Gagal fetch {ticker}: {e}")
         return None
 
-# ── Indikator Teknikal ──────────────────────────────────
+# ── Indikator ────────────────────────────────────────────
 def calc_rsi(prices, period=14):
-    if len(prices) < period + 1:
-        return 50
+    if len(prices) < period + 1: return 50
     gains  = [max(prices[i]-prices[i-1], 0) for i in range(1, len(prices))]
     losses = [max(prices[i-1]-prices[i], 0) for i in range(1, len(prices))]
     ag = sum(gains[-period:]) / period
@@ -103,236 +126,407 @@ def calc_rsi(prices, period=14):
     return 100 - (100 / (1 + ag/al))
 
 def calc_ema(prices, period):
-    if len(prices) < period:
-        return prices[-1]
-    k, ema = 2 / (period + 1), prices[0]
-    for p in prices[1:]:
-        ema = p * k + ema * (1 - k)
+    if len(prices) < period: return prices[-1]
+    k, ema = 2/(period+1), prices[0]
+    for p in prices[1:]: ema = p*k + ema*(1-k)
     return ema
 
 def calc_macd(prices):
     if len(prices) < 26: return 0, 0
-    macd   = calc_ema(prices, 12) - calc_ema(prices, 26)
-    signal = calc_ema([macd], 9)
-    return macd, signal
+    macd = calc_ema(prices, 12) - calc_ema(prices, 26)
+    return macd, calc_ema([macd], 9)
 
 # ── Fetch Berita ────────────────────────────────────────
 def get_berita(ticker):
-    """Ambil berita terkait saham dari Google News RSS"""
-    try:
-        url = f"https://news.google.com/rss/search?q={ticker}+saham+Indonesia&hl=id&gl=ID&ceid=ID:id"
-        r   = requests.get(url, timeout=10)
-        
-        # Parse RSS sederhana
-        import re
-        titles = re.findall(r'<title><!\[CDATA\[(.*?)\]\]></title>', r.text)
-        titles = [t for t in titles if ticker in t or "saham" in t.lower()][:3]
-        
-        if not titles:
-            return []
-        return titles
-    except:
-        return []
+    berita = []
+    sources = [
+        f"https://news.google.com/rss/search?q={ticker}+saham&hl=id&gl=ID&ceid=ID:id",
+        f"https://www.kontan.co.id/search?term={ticker}&rss=1",
+    ]
+    for url in sources:
+        try:
+            r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+            titles = re.findall(r'<title><!\[CDATA\[(.*?)\]\]></title>', r.text)
+            titles += re.findall(r'<title>(.*?)</title>', r.text)
+            for t in titles:
+                t = t.strip()
+                if ticker in t.upper() or "saham" in t.lower():
+                    if t not in berita and len(t) > 10:
+                        berita.append(t[:70])
+            if berita:
+                break
+        except:
+            continue
+    return berita[:3]
 
 def get_sentimen(berita_list):
-    """Analisa sentimen sederhana dari judul berita"""
-    positif = ["naik", "untung", "profit", "laba", "tumbuh", "meningkat", 
-                "rally", "bullish", "rekomendasi beli", "target", "dividen"]
-    negatif = ["turun", "rugi", "merosot", "anjlok", "bearish", "jual",
-                "koreksi", "delisting", "gagal", "masalah"]
-    
-    pos_count = 0
-    neg_count = 0
-    
-    for berita in berita_list:
-        berita_lower = berita.lower()
-        pos_count += sum(1 for k in positif if k in berita_lower)
-        neg_count += sum(1 for k in negatif if k in berita_lower)
-    
-    if pos_count > neg_count:
-        return "😊 POSITIF"
-    elif neg_count > pos_count:
-        return "😟 NEGATIF"
+    positif = ["naik", "untung", "profit", "laba", "tumbuh", "meningkat",
+               "rally", "bullish", "beli", "dividen", "akuisisi"]
+    negatif = ["turun", "rugi", "merosot", "anjlok", "bearish",
+               "koreksi", "delisting", "gagal", "masalah", "default"]
+    pos = sum(1 for b in berita_list for k in positif if k in b.lower())
+    neg = sum(1 for b in berita_list for k in negatif if k in b.lower())
+    if pos > neg: return "😊 POSITIF"
+    if neg > pos: return "😟 NEGATIF"
     return "😐 NETRAL"
 
-# ── Analisa & Signal ─────────────────────────────────────
-def analisa_saham(ticker):
-    data = get_stock_data(ticker)
-    if not data:
-        return None
+# ── Analisa ─────────────────────────────────────────────
+def analisa(ticker):
+    d = get_stock_data(ticker)
+    if not d: return None
 
-    price       = data["price"]
-    price_prev  = data["price_prev"]
-    volume      = data["volume"]
-    volume_avg  = data["volume_avg"]
-    closes      = data["closes"]
-    volumes     = data["volumes"]
+    price, price_prev = d["price"], d["price_prev"]
+    volume, vol_avg   = d["volume"], d["vol_avg"]
+    closes, volumes   = d["closes"], d["volumes"]
 
-    # Filter harga 50-200 perak (saham gocap)
-    if price < 50 or price > 300:
-        return None
+    rsi        = calc_rsi(closes)
+    ema9       = calc_ema(closes, 9)
+    ema21      = calc_ema(closes, 21)
+    macd, sig  = calc_macd(closes)
+    vol_ratio  = volume / vol_avg if vol_avg > 0 else 1
+    chg_pct    = (price - price_prev) / price_prev * 100
 
-    # Indikator
-    rsi      = calc_rsi(closes)
-    ema9     = calc_ema(closes, 9)
-    ema21    = calc_ema(closes, 21)
-    macd, signal = calc_macd(closes)
-    vol_ratio= volume / volume_avg if volume_avg > 0 else 1
-    chg_pct  = (price - price_prev) / price_prev * 100 if price_prev > 0 else 0
+    sinyal  = 0
+    reasons = []
 
-    sinyal   = 0
-    reasons  = []
-
-    # 1. Volume Spike — yang paling penting untuk gocap!
+    # Volume spike — prioritas utama
     if vol_ratio >= 5:
-        sinyal += 3
-        reasons.append(f"🚨 Volume SPIKE {vol_ratio:.0f}x!!!")
+        sinyal += 3; reasons.append(f"🚨 Volume SPIKE {vol_ratio:.0f}x!!!")
     elif vol_ratio >= 3:
-        sinyal += 2
-        reasons.append(f"🔥 Volume naik {vol_ratio:.1f}x")
+        sinyal += 2; reasons.append(f"🔥 Volume {vol_ratio:.1f}x")
     elif vol_ratio >= 2:
-        sinyal += 1
-        reasons.append(f"📈 Volume naik {vol_ratio:.1f}x")
+        sinyal += 1; reasons.append(f"📈 Volume {vol_ratio:.1f}x")
 
-    # 2. RSI oversold
-    if rsi < 35:
-        sinyal += 2
-        reasons.append(f"RSI={rsi:.0f} oversold✅")
-    elif rsi < 45:
-        sinyal += 1
-        reasons.append(f"RSI={rsi:.0f}✅")
+    if rsi < 35:   sinyal += 2; reasons.append(f"RSI={rsi:.0f} oversold✅")
+    elif rsi < 45: sinyal += 1; reasons.append(f"RSI={rsi:.0f}✅")
 
-    # 3. EMA trend
-    if ema9 > ema21:
-        sinyal += 1
-        reasons.append("EMA9>EMA21✅")
-
-    # 4. MACD
-    if macd > signal:
-        sinyal += 1
-        reasons.append("MACD✅")
-
-    # 5. Harga naik hari ini
-    if chg_pct > 0:
-        sinyal += 1
-        reasons.append(f"Naik +{chg_pct:.1f}%✅")
+    if ema9 > ema21: sinyal += 1; reasons.append("EMA9>EMA21✅")
+    if macd > sig:   sinyal += 1; reasons.append("MACD✅")
+    if chg_pct > 0:  sinyal += 1; reasons.append(f"+{chg_pct:.1f}%✅")
 
     return {
-        "ticker":    ticker,
-        "price":     price,
-        "chg_pct":   chg_pct,
-        "volume":    volume,
-        "vol_ratio": vol_ratio,
-        "rsi":       rsi,
-        "ema9":      ema9,
-        "ema21":     ema21,
-        "sinyal":    sinyal,
-        "reasons":   reasons,
+        "ticker": ticker, "price": price, "chg_pct": chg_pct,
+        "vol_ratio": vol_ratio, "rsi": rsi,
+        "ema9": ema9, "ema21": ema21,
+        "sinyal": sinyal, "reasons": reasons,
     }
 
-def send_signal(result):
+def send_signal(result, label="📊 SIGNAL"):
     ticker    = result["ticker"]
     price     = result["price"]
     chg_pct   = result["chg_pct"]
     vol_ratio = result["vol_ratio"]
-    rsi       = result["rsi"]
     sinyal    = result["sinyal"]
     reasons   = result["reasons"]
+    target    = price * 1.08
+    sl        = price * 0.95
 
-    # Target dan stop loss
-    target    = price * 1.08  # target +8%
-    stoploss  = price * 0.95  # stop loss -5%
+    berita   = get_berita(ticker)
+    sentimen = get_sentimen(berita)
+    berita_str = "\n".join([f"• {b}" for b in berita]) if berita else "• Tidak ada berita"
 
-    # Ambil berita
-    berita    = get_berita(ticker)
-    sentimen  = get_sentimen(berita)
-
-    # Berita list
-    berita_str = ""
-    if berita:
-        for b in berita[:2]:
-            berita_str += f"• {b[:60]}...\n"
-    else:
-        berita_str = "• Tidak ada berita terkini\n"
-
-    # Emoji volume
-    if vol_ratio >= 5:
-        vol_emoji = "🚨🚨🚨"
-    elif vol_ratio >= 3:
-        vol_emoji = "🔥🔥"
-    else:
-        vol_emoji = "📈"
-
+    vol_emoji = "🚨" if vol_ratio >= 5 else "🔥" if vol_ratio >= 3 else "📈"
     chg_emoji = "🟢" if chg_pct >= 0 else "🔴"
 
-    msg = (
-        f"📊 *SIGNAL SAHAM: {ticker}*\n"
+    send_telegram(
+        f"{label}: *{ticker}*\n"
         f"⏰ {now_str()}\n\n"
-        f"💰 Harga: *{fmt_harga(price)}*\n"
+        f"💰 Harga: *{fmt(price)}*\n"
         f"{chg_emoji} Perubahan: {chg_pct:+.1f}%\n"
         f"{vol_emoji} Volume: {vol_ratio:.1f}x rata-rata\n\n"
-        f"*Indikator:*\n"
+        f"*Indikator ({sinyal} sinyal):*\n"
         f"{chr(10).join(reasons)}\n\n"
-        f"*📰 Berita:*\n"
-        f"{berita_str}"
+        f"*📰 Berita:*\n{berita_str}\n"
         f"*Sentimen: {sentimen}*\n\n"
-        f"🎯 Target: {fmt_harga(target)} (+8%)\n"
-        f"🛑 Stop Loss: {fmt_harga(stoploss)} (-5%)\n\n"
-        f"⚠️ _Bukan saran investasi — lakukan riset sendiri!_"
+        f"🎯 Target: {fmt(target)} (+8%)\n"
+        f"🛑 Stop Loss: {fmt(sl)} (-5%)\n\n"
+        f"⚠️ _Bukan saran investasi!_"
     )
-    send_telegram(msg)
-    print(f"📊 Signal terkirim: {ticker} | {sinyal} sinyal | Vol {vol_ratio:.1f}x")
 
-# ── Scan Semua Saham ─────────────────────────────────────
-def scan_saham():
-    global alerted_today
+# ── Pantau Posisi ────────────────────────────────────────
+def cek_posisi():
+    """Cek P/L semua posisi yang dipegang"""
+    if not data["posisi"]:
+        return
+    for ticker, pos in list(data["posisi"].items()):
+        d = get_stock_data(ticker)
+        if not d: continue
+        curr      = d["price"]
+        modal     = pos["modal"]
+        harga_beli= pos["harga_beli"]
+        qty       = modal / harga_beli
+        pl_pct    = (curr - harga_beli) / harga_beli * 100
+        pl_idr    = (curr - harga_beli) * qty
+        emoji     = "🟢" if pl_pct >= 0 else "🔴"
+
+        # Notif kalau profit >= 8% atau loss >= 5%
+        if pl_pct >= 8:
+            send_telegram(
+                f"🎯 *TARGET PROFIT: {ticker}*\n"
+                f"💰 Harga: {fmt(curr)}\n"
+                f"🟢 P/L: +{pl_pct:.1f}% (+{fmt(pl_idr)})\n"
+                f"Pertimbangkan untuk jual! 😄"
+            )
+        elif pl_pct <= -5:
+            send_telegram(
+                f"🛑 *STOP LOSS: {ticker}*\n"
+                f"💰 Harga: {fmt(curr)}\n"
+                f"🔴 P/L: {pl_pct:.1f}% ({fmt(pl_idr)})\n"
+                f"Pertimbangkan cut loss! ⚠️"
+            )
+        time.sleep(0.5)
+
+# ── Scan Watchlist ───────────────────────────────────────
+def scan_watchlist():
     now = datetime.now(WIB)
+    hari = now.weekday()
+    jam  = now.hour * 60 + now.minute
 
-    # Reset alert harian setiap tengah malam
-    if now.hour == 0 and now.minute < 5:
-        alerted_today = set()
-
-    hari = now.weekday()  # 0=Senin, 4=Jumat, 5=Sabtu, 6=Minggu
-
-    # Sabtu & Minggu libur
     if hari in [5, 6]:
-        print(f"[{now_str()}] Akhir pekan — libur trading!")
+        log("Akhir pekan — libur!")
         return
-
-    # Jumat tutup jam 16:00
     if hari == 4 and now.hour >= 16:
-        print(f"[{now_str()}] Jumat sudah tutup!")
+        log("Jumat sudah tutup!")
+        return
+    if not (8*60+30 <= jam < 16*60):
+        log("Di luar jam trading")
         return
 
-    # Scan hanya jam trading: 09:00-16:00 WIB
-    if not (now.hour > 8 or (now.hour == 8 and now.minute >= 30)) or now.hour >= 16:
-        print(f"[{now_str()}] Di luar jam trading — skip scan")
+    if not data["watchlist"]:
+        log("Watchlist kosong!")
         return
 
-    print(f"[{now_str()}] Scanning {len(WATCHLIST)} saham...")
-
+    log(f"Scanning {len(data['watchlist'])} saham...")
     candidates = []
-    for ticker in WATCHLIST:
-        result = analisa_saham(ticker)
+    for ticker in data["watchlist"]:
+        result = analisa(ticker)
         if result and result["sinyal"] >= 3:
             candidates.append(result)
-        time.sleep(0.5)  # jangan spam Yahoo Finance
+        time.sleep(0.5)
 
-    # Sort by sinyal terkuat
     candidates.sort(key=lambda x: x["sinyal"], reverse=True)
-
-    # Kirim signal untuk yang belum dapat alert hari ini
-    for result in candidates[:3]:  # max 3 signal per scan
-        ticker = result["ticker"]
-        if ticker not in alerted_today:
+    for result in candidates[:3]:
+        if result["ticker"] not in alerted_today:
             send_signal(result)
-            alerted_today.add(ticker)
+            alerted_today.add(result["ticker"])
             time.sleep(2)
 
     if not candidates:
-        print(f"[{now_str()}] Tidak ada kandidat yang memenuhi syarat")
+        log("Tidak ada kandidat")
 
-# ── Telegram Commands ────────────────────────────────────
+# ── Jam Notif ────────────────────────────────────────────
+sent_notif = set()
+
+def cek_notif_jadwal():
+    now  = datetime.now(WIB)
+    hari = now.weekday()
+    key  = now.strftime("%Y%m%d%H%M")
+
+    if hari < 5 and now.hour == 8 and now.minute == 30 and key not in sent_notif:
+        sent_notif.add(key)
+        send_telegram("🔔 *Pasar Buka!*\n📅 08:30 WIB — Bursa buka!\n📊 Bot mulai scan saham...\nSemangat trading! 💪")
+
+    if hari == 4 and now.hour == 16 and now.minute == 0 and key not in sent_notif:
+        sent_notif.add(key)
+        send_telegram("🔔 *Pasar Tutup!*\n📅 Jumat 16:00 WIB — Bursa tutup!\n😴 Sampai Senin pagi!\nSelamat weekend! 🎉")
+
+    # Reset alert harian
+    if now.hour == 0 and now.minute == 0:
+        alerted_today.clear()
+
+# ── Command Handler ──────────────────────────────────────
+def handle_command(text):
+    parts = text.strip().split()
+    cmd   = parts[0].lower()
+
+    # /pantau TICKER
+    if cmd == "/pantau":
+        if len(parts) < 2:
+            send_telegram("Format: /pantau TICKER\nContoh: /pantau WIRG")
+            return
+        ticker = parts[1].upper()
+        if ticker in data["watchlist"]:
+            send_telegram(f"⚠️ {ticker} sudah ada di watchlist!")
+            return
+        # Validasi ticker
+        d = get_stock_data(ticker)
+        if not d:
+            send_telegram(f"❌ Saham {ticker} tidak ditemukan di Yahoo Finance!")
+            return
+        data["watchlist"].append(ticker)
+        save_data()
+        send_telegram(
+            f"✅ *{ticker} ditambahkan ke watchlist!*\n"
+            f"💰 Harga sekarang: {fmt(d['price'])}\n"
+            f"📋 Total watchlist: {len(data['watchlist'])} saham"
+        )
+
+    # /hapus TICKER
+    elif cmd == "/hapus":
+        if len(parts) < 2:
+            send_telegram("Format: /hapus TICKER\nContoh: /hapus WIRG")
+            return
+        ticker = parts[1].upper()
+        if ticker not in data["watchlist"]:
+            send_telegram(f"❌ {ticker} tidak ada di watchlist!")
+            return
+        data["watchlist"].remove(ticker)
+        save_data()
+        send_telegram(f"✅ *{ticker} dihapus dari watchlist!*")
+
+    # /beli TICKER MODAL
+    elif cmd == "/beli":
+        if len(parts) < 3:
+            send_telegram("Format: /beli TICKER MODAL\nContoh: /beli WIRG 500000")
+            return
+        ticker = parts[1].upper()
+        try:
+            modal = float(parts[2].replace(".", "").replace(",", ""))
+        except:
+            send_telegram("❌ Modal tidak valid!")
+            return
+        d = get_stock_data(ticker)
+        if not d:
+            send_telegram(f"❌ Saham {ticker} tidak ditemukan!")
+            return
+        harga_beli = d["price"]
+        data["posisi"][ticker] = {
+            "modal":      modal,
+            "harga_beli": harga_beli,
+            "waktu":      now_str()
+        }
+        save_data()
+        qty = modal / harga_beli
+        send_telegram(
+            f"✅ *Posisi {ticker} dicatat!*\n"
+            f"💰 Harga beli: {fmt(harga_beli)}\n"
+            f"📦 Qty estimasi: {qty:.0f} lot\n"
+            f"💵 Modal: {fmt(modal)}\n"
+            f"🎯 Target: {fmt(harga_beli * 1.08)} (+8%)\n"
+            f"🛑 Stop Loss: {fmt(harga_beli * 0.95)} (-5%)"
+        )
+
+    # /jual TICKER
+    elif cmd == "/jual":
+        if len(parts) < 2:
+            send_telegram("Format: /jual TICKER\nContoh: /jual WIRG")
+            return
+        ticker = parts[1].upper()
+        if ticker not in data["posisi"]:
+            send_telegram(f"❌ Tidak ada posisi {ticker}!")
+            return
+        pos  = data["posisi"][ticker]
+        d    = get_stock_data(ticker)
+        curr = d["price"] if d else pos["harga_beli"]
+        pl_pct = (curr - pos["harga_beli"]) / pos["harga_beli"] * 100
+        pl_idr = (curr - pos["harga_beli"]) * (pos["modal"] / pos["harga_beli"])
+        emoji  = "🟢" if pl_pct >= 0 else "🔴"
+        del data["posisi"][ticker]
+        save_data()
+        send_telegram(
+            f"✅ *Posisi {ticker} ditutup!*\n"
+            f"💰 Harga jual: {fmt(curr)}\n"
+            f"💰 Harga beli: {fmt(pos['harga_beli'])}\n"
+            f"{emoji} P/L: {pl_pct:+.1f}% ({fmt(pl_idr)})\n"
+            f"📅 Masuk: {pos['waktu']}\n"
+            f"📅 Keluar: {now_str()}"
+        )
+
+    # /posisi
+    elif cmd == "/posisi":
+        if not data["posisi"]:
+            send_telegram("📊 Tidak ada posisi aktif!")
+            return
+        msg = "📊 *Posisi Aktif:*\n\n"
+        total_modal = 0
+        total_pl    = 0
+        for ticker, pos in data["posisi"].items():
+            d    = get_stock_data(ticker)
+            curr = d["price"] if d else pos["harga_beli"]
+            pl_pct = (curr - pos["harga_beli"]) / pos["harga_beli"] * 100
+            pl_idr = (curr - pos["harga_beli"]) * (pos["modal"] / pos["harga_beli"])
+            emoji  = "🟢" if pl_pct >= 0 else "🔴"
+            msg += f"{emoji} *{ticker}*: {fmt(curr)} | {pl_pct:+.1f}% ({fmt(pl_idr)})\n"
+            total_modal += pos["modal"]
+            total_pl    += pl_idr
+            time.sleep(0.3)
+        net_emoji = "🟢" if total_pl >= 0 else "🔴"
+        msg += f"\n{net_emoji} *Total P/L: {fmt(total_pl)}*"
+        send_telegram(msg)
+
+    # /cek TICKER
+    elif cmd == "/cek":
+        if len(parts) < 2:
+            send_telegram("Format: /cek TICKER\nContoh: /cek BBCA")
+            return
+        ticker = parts[1].upper()
+        send_telegram(f"🔍 Menganalisa *{ticker}*...")
+        result = analisa(ticker)
+        if result:
+            send_signal(result, f"📊 Analisa {ticker}")
+        else:
+            send_telegram(f"❌ Tidak ada data untuk {ticker}!")
+
+    # /scan
+    elif cmd == "/scan":
+        send_telegram("🔍 Scanning watchlist sekarang...")
+        scan_watchlist()
+
+    # /watchlist
+    elif cmd == "/watchlist":
+        if not data["watchlist"]:
+            send_telegram("📋 Watchlist kosong!\nGunakan /pantau TICKER untuk tambah saham.")
+            return
+        wl = "\n".join([f"• {t}" for t in data["watchlist"]])
+        send_telegram(f"📋 *Watchlist ({len(data['watchlist'])} saham):*\n{wl}")
+
+    # /status
+    elif cmd == "/status":
+        now  = datetime.now(WIB)
+        hari = now.weekday()
+        jam  = now.hour * 60 + now.minute
+        hari_nama = ["Senin","Selasa","Rabu","Kamis","Jumat","Sabtu","Minggu"][hari]
+        if hari in [5, 6]:
+            status = "❌ LIBUR AKHIR PEKAN"
+        elif 8*60+30 <= jam < 16*60:
+            status = "✅ JAM TRADING"
+        else:
+            status = "❌ LUAR JAM TRADING"
+
+        send_telegram(
+            f"📊 *Saham Bot Status*\n"
+            f"⏰ {now_str()} ({hari_nama})\n"
+            f"📈 {status}\n"
+            f"👁️ Watchlist: {len(data['watchlist'])} saham\n"
+            f"💼 Posisi aktif: {len(data['posisi'])} saham\n"
+            f"🔔 Alert hari ini: {len(alerted_today)}\n\n"
+            f"*Command:*\n"
+            f"/pantau TICKER — tambah ke watchlist\n"
+            f"/hapus TICKER — hapus dari watchlist\n"
+            f"/beli TICKER MODAL — catat posisi beli\n"
+            f"/jual TICKER — catat posisi jual\n"
+            f"/posisi — lihat semua posisi\n"
+            f"/cek TICKER — analisa 1 saham\n"
+            f"/scan — scan watchlist sekarang\n"
+            f"/watchlist — lihat watchlist"
+        )
+
+    else:
+        send_telegram(
+            f"❓ Command tidak dikenal.\n\n"
+            f"*Command:*\n"
+            f"/pantau TICKER — tambah watchlist\n"
+            f"/hapus TICKER — hapus watchlist\n"
+            f"/beli TICKER MODAL — catat beli\n"
+            f"/jual TICKER — catat jual\n"
+            f"/posisi — lihat posisi\n"
+            f"/cek TICKER — analisa saham\n"
+            f"/scan — scan sekarang\n"
+            f"/watchlist — lihat watchlist\n"
+            f"/status — status bot"
+        )
+
+# ── Telegram Updates ─────────────────────────────────────
 def get_tg_updates():
     global last_update_id
     try:
@@ -346,109 +540,48 @@ def get_tg_updates():
     except: pass
     return []
 
-def handle_command(text):
-    text = text.strip().lower()
-
-    if text == "/scan":
-        send_telegram("🔍 Scanning saham sekarang...")
-        scan_saham()
-
-    elif text.startswith("/cek "):
-        ticker = text[5:].strip().upper()
-        send_telegram(f"🔍 Menganalisa {ticker}...")
-        result = analisa_saham(ticker)
-        if result:
-            send_signal(result)
-        else:
-            send_telegram(f"❌ Tidak ada data untuk {ticker} atau harga di luar range!")
-
-    elif text == "/watchlist":
-        wl = "\n".join([f"• {t}" for t in WATCHLIST])
-        send_telegram(f"📋 *Watchlist Saham:*\n{wl}")
-
-    elif text == "/status":
-        now = datetime.now(WIB)
-        jam_trading = "✅ JAM TRADING" if 9 <= now.hour < 16 else "❌ LUAR JAM TRADING"
-        send_telegram(
-            f"📊 *Saham Bot Status*\n"
-            f"⏰ {now_str()}\n"
-            f"📈 {jam_trading}\n"
-            f"👁️ Watchlist: {len(WATCHLIST)} saham\n"
-            f"🔔 Alert hari ini: {len(alerted_today)} saham\n\n"
-            f"*Command:*\n"
-            f"/scan — scan semua saham sekarang\n"
-            f"/cek TICKER — analisa 1 saham\n"
-            f"/watchlist — lihat daftar saham\n"
-            f"/status — status bot"
-        )
-    else:
-        send_telegram(
-            f"❓ Command tidak dikenal.\n\n"
-            f"*Command:*\n"
-            f"/scan — scan semua saham\n"
-            f"/cek TICKER — analisa 1 saham (contoh: /cek BBCA)\n"
-            f"/watchlist — lihat watchlist\n"
-            f"/status — status bot"
-        )
-
 def check_tg_commands():
-    updates = get_tg_updates()
-    for update in updates:
+    for update in get_tg_updates():
         global last_update_id
         last_update_id = update["update_id"]
         msg     = update.get("message", {})
         text    = msg.get("text", "")
         chat_id = str(msg.get("chat", {}).get("id", ""))
         if text and text.startswith("/") and chat_id == str(TG_CHAT_ID):
-            print(f"📱 Command: {text}")
+            log(f"📱 Command: {text}")
             handle_command(text)
 
 # ── Main ─────────────────────────────────────────────────
 def main():
-    print("🚀 Saham Bot dimulai...")
+    log("🚀 Saham Bot v2 dimulai...")
+    load_data()
     send_telegram(
         f"🚀 *Saham Signal Bot AKTIF!*\n"
-        f"👁️ Memantau {len(WATCHLIST)} saham gocap\n"
-        f"🔔 Auto scan setiap 30 menit jam trading\n\n"
+        f"👁️ Watchlist: {len(data['watchlist'])} saham\n"
+        f"💼 Posisi: {len(data['posisi'])} saham\n"
+        f"⏰ Jam trading: 08:30-16:00 WIB\n\n"
         f"*Command:*\n"
-        f"/scan — scan semua saham\n"
-        f"/cek TICKER — analisa 1 saham\n"
-        f"/watchlist — lihat watchlist\n"
-        f"/status — status bot"
+        f"/pantau TICKER — tambah watchlist\n"
+        f"/beli TICKER MODAL — catat posisi\n"
+        f"/scan — scan sekarang\n"
+        f"/status — status lengkap"
     )
 
     tick = 0
     while True:
         try:
             check_tg_commands()
-            # Scan otomatis setiap 30 menit
+            cek_notif_jadwal()
+            # Scan & cek posisi setiap 30 menit
             if tick % (30 * 60 // 5) == 0:
-                scan_saham()
-
-            # Notif Jumat jam 16:00 — pasar tutup
-            now_check = datetime.now(WIB)
-            if now_check.weekday() == 4 and now_check.hour == 16 and now_check.minute == 0 and tick % 12 == 0:
-                send_telegram(
-                    "🔔 *Pasar Tutup!*\n"
-                    "📅 Jumat 16:00 WIB — Bursa tutup!\n"
-                    "😴 Bot istirahat sampai Senin pagi 09:00 WIB.\n"
-                    "Selamat weekend! 🎉"
-                )
-
-            # Notif setiap hari Senin-Jumat jam 08:30 — pasar buka
-            if now_check.weekday() < 5 and now_check.hour == 8 and now_check.minute == 30 and tick % 12 == 0:
-                send_telegram(
-                    "🔔 *Pasar Buka!*\n"
-                    "📅 08:30 WIB — Bursa buka!\n"
-                    "📊 Bot mulai scan saham...\n"
-                    "Semangat trading! 💪"
-                )
+                scan_watchlist()
+                cek_posisi()
             tick += 1
             time.sleep(5)
         except KeyboardInterrupt:
             break
         except Exception as e:
-            print(f"❌ Error: {e}")
+            log(f"❌ Error: {e}")
             time.sleep(30)
 
 if __name__ == "__main__":

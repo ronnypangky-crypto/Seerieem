@@ -10,6 +10,20 @@ GITHUB_FILE  = "saham_data.json"
 
 WIB = timezone(timedelta(hours=7))
 
+# ── Filter Harga Saham ──────────────────────────────────
+MIN_HARGA    = float(os.environ.get("MIN_HARGA",    "50"))    # min harga saham
+MAX_HARGA    = float(os.environ.get("MAX_HARGA",    "1000"))   # max harga saham
+MIN_SINYAL   = int(os.environ.get("MIN_SINYAL",    "3"))      # min sinyal untuk alert
+SCAN_MENIT   = int(os.environ.get("SCAN_MENIT",    "20"))     # scan tiap X menit
+
+# Default watchlist — saham gocap aktif
+DEFAULT_WATCHLIST = [
+    "BUMI", "BRPT", "DEWA", "FIRE", "KONI",
+    "MITI", "MICE", "WIRG", "TINS", "ANTM",
+    "WIKA", "ADHI", "PTPP", "WSKT", "MDKA",
+    "INCO", "VALE", "SMCB", "BSDE", "LPKR",
+]
+
 # ── State ───────────────────────────────────────────────
 last_update_id = 0
 alerted_today  = set()
@@ -56,8 +70,14 @@ def load_data():
             content = base64.b64decode(r.json()["content"]).decode("utf-8")
             data = json.loads(content)
             log(f"✅ Data loaded — {len(data['watchlist'])} saham dipantau")
+            # Tambah default watchlist kalau masih kosong
+            if not data["watchlist"]:
+                data["watchlist"] = DEFAULT_WATCHLIST.copy()
+                save_data()
+                log(f"📋 Default watchlist ditambahkan: {len(data['watchlist'])} saham")
         else:
-            log("📂 File belum ada — mulai dari awal")
+            log("📂 File belum ada — pakai default watchlist")
+            data["watchlist"] = DEFAULT_WATCHLIST.copy()
             save_data()
     except Exception as e:
         log(f"⚠️ Gagal load: {e}")
@@ -300,7 +320,7 @@ def scan_watchlist():
     candidates = []
     for ticker in data["watchlist"]:
         result = analisa(ticker)
-        if result and result["sinyal"] >= 3:
+        if result and result["sinyal"] >= MIN_SINYAL:
             candidates.append(result)
         time.sleep(0.5)
 
@@ -511,6 +531,21 @@ def handle_command(text):
             f"/watchlist — lihat watchlist"
         )
 
+    # /config — lihat dan edit settings
+    elif cmd == "/config":
+        send_telegram(
+            f"⚙️ *Settings Saham Bot*\n\n"
+            f"💰 Harga min: {fmt(MIN_HARGA)}\n"
+            f"💰 Harga max: {fmt(MAX_HARGA)}\n"
+            f"📊 Min sinyal: {MIN_SINYAL}\n"
+            f"⏱️ Scan tiap: {SCAN_MENIT} menit\n\n"
+            f"*Edit via Railway Variables:*\n"
+            f"`MIN_HARGA` — harga minimum saham\n"
+            f"`MAX_HARGA` — harga maximum saham\n"
+            f"`MIN_SINYAL` — minimum sinyal (1-5)\n"
+            f"`SCAN_MENIT` — interval scan (menit)"
+        )
+
     else:
         send_telegram(
             f"❓ Command tidak dikenal.\n\n"
@@ -523,6 +558,7 @@ def handle_command(text):
             f"/cek TICKER — analisa saham\n"
             f"/scan — scan sekarang\n"
             f"/watchlist — lihat watchlist\n"
+            f"/config — lihat settings\n"
             f"/status — status bot"
         )
 
@@ -572,8 +608,8 @@ def main():
         try:
             check_tg_commands()
             cek_notif_jadwal()
-            # Scan & cek posisi setiap 30 menit
-            if tick % (30 * 60 // 5) == 0:
+            # Scan & cek posisi setiap SCAN_MENIT menit
+            if tick % (SCAN_MENIT * 60 // 5) == 0:
                 scan_watchlist()
                 cek_posisi()
             tick += 1
